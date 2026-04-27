@@ -32,8 +32,7 @@ ai = OpenAI(api_key=OPENAI_API_KEY)
 def get_interests():
     logger.info("Fetching interests from Notion")
     results = notion.databases.query(
-        database_id=INTERESTS_DB_ID,
-        filter={}
+        database_id=INTERESTS_DB_ID
     )
     interests = []
 
