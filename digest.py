@@ -243,7 +243,11 @@ def run():
         for u in updates:
             all_updates += f"- {u['title']}\n  {u['date']}\n  {u['link']}\n"
 
+    logger.info("\n%s\n%s\n%s", "=" * 60, all_updates.strip(), "=" * 60)
+
     raw = summarise(all_updates)
+
+    logger.info("\n%s\nOPENAI RAW RESPONSE:\n%s\n%s", "-" * 60, raw.strip(), "-" * 60)
 
     try:
         parsed = json.loads(raw)
