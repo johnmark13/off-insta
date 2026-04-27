@@ -149,7 +149,7 @@ def write_digest(summary, alerts=""):
     notion.pages.create(
         parent={"database_id": DIGEST_DB_ID},
         properties={
-            "Date": {"rich_text": [{"text": {"content": today}}]},
+            "Date": {"title": [{"text": {"content": today}}]},
             "Important Alerts": {"number": alerts_count},
             "Summary": {"rich_text": [{"text": {"content": summary}}]}
         }
