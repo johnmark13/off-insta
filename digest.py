@@ -135,11 +135,22 @@ def write_digest(summary, alerts=""):
     logger.info("Writing digest to Notion")
     today = datetime.now().strftime("%Y-%m-%d")
 
+    if isinstance(alerts, int):
+        alerts_count = max(alerts, 0)
+    elif isinstance(alerts, list):
+        alerts_count = len(alerts)
+    elif isinstance(alerts, str):
+        alerts_count = len([line for line in alerts.splitlines() if line.strip()])
+    else:
+        alerts_count = 0
+
+    logger.info("Important alerts count: %d", alerts_count)
+
     notion.pages.create(
         parent={"database_id": DIGEST_DB_ID},
         properties={
-            "Date": {"date": {"start": today}},
-            "Important Alerts": {"rich_text": [{"text": {"content": alerts}}]},
+            "Date": {"rich_text": [{"text": {"content": today}}]},
+            "Important Alerts": {"number": alerts_count},
             "Summary": {"rich_text": [{"text": {"content": summary}}]}
         }
     )
