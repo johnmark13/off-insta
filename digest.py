@@ -7,8 +7,11 @@ from notion_client import Client
 from openai import OpenAI
 from dotenv import load_dotenv
 from datetime import datetime
+import json
 
-
+# ----------------------------
+# Logging
+# ----------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -16,6 +19,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ----------------------------
+# Env
+# ----------------------------
 load_dotenv()
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
@@ -30,13 +36,13 @@ ai = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # ----------------------------
-# 1. Get Interests from Notion
+# 1. Get Interests
 # ----------------------------
 def get_interests():
     logger.info("Fetching interests from Notion")
-    results = notion.databases.query(
-        database_id=INTERESTS_DB_ID
-    )
+
+    results = notion.databases.query(database_id=INTERESTS_DB_ID)
+
     interests = []
 
     for r in results["results"]:
@@ -57,13 +63,11 @@ def get_interests():
 
 
 # ----------------------------
-# 2. Simple “fresh info” fetch
-# (placeholder web search layer)
+# 2. Fetch RSS updates
 # ----------------------------
 def fetch_updates(name):
     logger.info("Fetching RSS updates for: %s", name)
 
-    # Google News RSS search endpoint
     query = quote_plus(f"{name} music tour interview announcement OR release")
     url = f"https://news.google.com/rss/search?q={query}&hl=en-GB&gl=GB&ceid=GB:en"
 
@@ -74,12 +78,11 @@ def fetch_updates(name):
         logger.warning("RSS fetch failed for %s: %s", name, e)
         return []
 
-    # Parse XML feed
     root = ET.fromstring(response.content)
 
     items = []
 
-    for item in root.findall(".//item")[:5]:  # limit noise
+    for item in root.findall(".//item")[:5]:
         title = item.find("title").text if item.find("title") is not None else ""
         link = item.find("link").text if item.find("link") is not None else ""
         pub_date = item.find("pubDate").text if item.find("pubDate") is not None else ""
@@ -91,46 +94,39 @@ def fetch_updates(name):
         })
 
     logger.info("Found %d RSS items for %s", len(items), name)
-
     return items
 
 
 # ----------------------------
-# 3. AI summariser
+# 3. AI summariser (STRUCTURED OUTPUT)
 # ----------------------------
 def summarise(all_updates):
-    logger.info("Generating summary via OpenAI")
+    logger.info("Generating structured summary via OpenAI")
+
     prompt = f"""
 You are a CULTURE INTELLIGENCE assistant.
 
-Your job is to extract ONLY real cultural updates about artists, writers, and creators.
+You must extract ONLY real cultural updates.
 
-You MUST NOT invent or generalise.
+Return STRICT JSON in this format:
+
+{{
+  "summary": "concise cultural digest",
+  "important_alerts": [
+    {{
+      "name": "artist name",
+      "update": "what happened",
+      "relevance": "London | Global | None"
+    }}
+  ]
+}}
 
 Rules:
-- Only use information explicitly present in the data
-- If no real update exists, say "No verified update"
-- Ignore corporate language completely
+- Only use provided data
+- Do NOT invent anything
+- If nothing exists, return empty list []
 - Focus only on:
-  - tours
-  - releases
-  - collaborations
-  - interviews
-  - recommendations
-- Do NOT mention:
-  - business metrics
-  - engineering
-  - product updates
-  - generic summaries
-
-Return format:
-
-## Daily Digest
-
-For each person:
-- Name
-- Update (or "No update")
-- Relevance (London / Global / None)
+  tours, releases, collaborations, interviews
 
 DATA:
 {all_updates}
@@ -148,16 +144,21 @@ DATA:
 # 4. Extract discoveries
 # ----------------------------
 def extract_discoveries(text):
-    logger.info("Extracting discoveries via OpenAI")
+    logger.info("Extracting discoveries")
+
     prompt = f"""
 From this digest, extract NEW people/artists mentioned
 that are NOT the main subjects.
 
-Return JSON list with:
-- name
-- reason
-- source
-- confidence (low/medium/high)
+Return JSON list:
+[
+  {{
+    "name": "",
+    "reason": "",
+    "source": "",
+    "confidence": "low|medium|high"
+  }}
+]
 
 TEXT:
 {text}
@@ -172,20 +173,14 @@ TEXT:
 
 
 # ----------------------------
-# 5. Write Daily Digest to Notion
+# 5. Write digest to Notion
 # ----------------------------
-def write_digest(summary, alerts=""):
+def write_digest(summary, alerts):
     logger.info("Writing digest to Notion")
+
     today = datetime.now().strftime("%Y-%m-%d")
 
-    if isinstance(alerts, int):
-        alerts_count = max(alerts, 0)
-    elif isinstance(alerts, list):
-        alerts_count = len(alerts)
-    elif isinstance(alerts, str):
-        alerts_count = len([line for line in alerts.splitlines() if line.strip()])
-    else:
-        alerts_count = 0
+    alerts_count = len(alerts)
 
     logger.info("Important alerts count: %d", alerts_count)
 
@@ -200,19 +195,19 @@ def write_digest(summary, alerts=""):
 
 
 # ----------------------------
-# 6. Write discovery items
+# 6. Write discoveries
 # ----------------------------
 def write_discoveries(discoveries_json):
-    # very simple parser (you can improve later)
-    import json
-    logger.info("Writing discoveries to Notion")
+    logger.info("Writing discoveries")
+
     try:
         items = json.loads(discoveries_json)
-    except json.JSONDecodeError:
+    except Exception:
         logger.warning("Failed to parse discoveries JSON")
         return
 
-    logger.info("Writing %d discovery items", len(items))
+    logger.info("Writing %d discoveries", len(items))
+
     for item in items:
         notion.pages.create(
             parent={"database_id": DISCOVERY_DB_ID},
@@ -230,22 +225,42 @@ def write_discoveries(discoveries_json):
 # MAIN PIPELINE
 # ----------------------------
 def run():
-    logger.info("Starting digest pipeline")
+    logger.info("Starting pipeline")
+
     interests = get_interests()
 
     all_updates = ""
 
     for i in interests:
-        update = fetch_updates(i["name"])
-        all_updates += f"\n\n{i['name']}:\n{update}"
+        updates = fetch_updates(i["name"])
 
-    summary = summarise(all_updates)
-    discoveries = extract_discoveries(summary)
+        all_updates += f"\n\n{i['name']}:\n"
 
-    write_digest(summary)
-    write_discoveries(discoveries)
+        if not updates:
+            all_updates += "No recent news found\n"
+            continue
 
-    logger.info("Digest pipeline complete")
+        for u in updates:
+            all_updates += f"- {u['title']}\n  {u['date']}\n  {u['link']}\n"
+
+    raw = summarise(all_updates)
+
+    try:
+        parsed = json.loads(raw)
+    except Exception as e:
+        logger.warning("Failed to parse summary JSON, fallback mode: %s", e)
+        parsed = {
+            "summary": raw,
+            "important_alerts": []
+        }
+
+    summary = parsed["summary"]
+    alerts = parsed["important_alerts"]
+
+    write_digest(summary, alerts)
+    write_discoveries(extract_discoveries(summary))
+
+    logger.info("Pipeline complete")
 
 
 if __name__ == "__main__":
