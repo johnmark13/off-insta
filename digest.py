@@ -107,6 +107,69 @@ def normalize_name(name):
     return " ".join(name.strip().lower().split())
 
 
+def notion_page_url(page_id):
+    """Return direct Notion URL for a page id."""
+    return f"https://www.notion.so/{page_id.replace('-', '')}"
+
+
+def update_full_report_property(digest_page_id, digest_page_url):
+    """Populate the Full Report property using the database's configured property type."""
+    try:
+        db = notion.databases.retrieve(database_id=DIGEST_DB_ID)
+        props = db.get("properties", {})
+        full_report_prop = props.get("Full Report")
+
+        if not full_report_prop:
+            logger.warning("Digest DB has no 'Full Report' property; skipping link update")
+            return
+
+        prop_type = full_report_prop.get("type")
+        logger.info("Full Report property type: %s", prop_type)
+
+        if prop_type == "url":
+            notion.pages.update(
+                page_id=digest_page_id,
+                properties={"Full Report": {"url": digest_page_url}}
+            )
+            logger.info("Full Report URL property updated")
+            return
+
+        if prop_type == "rich_text":
+            notion.pages.update(
+                page_id=digest_page_id,
+                properties={
+                    "Full Report": {
+                        "rich_text": [{"text": {"content": digest_page_url}}]
+                    }
+                }
+            )
+            logger.info("Full Report rich_text property updated")
+            return
+
+        if prop_type == "relation":
+            relation_cfg = full_report_prop.get("relation", {})
+            target_db_id = relation_cfg.get("database_id")
+
+            # If relation points to this same DB, self-link the current digest row.
+            if target_db_id == DIGEST_DB_ID:
+                notion.pages.update(
+                    page_id=digest_page_id,
+                    properties={"Full Report": {"relation": [{"id": digest_page_id}]}}
+                )
+                logger.info("Full Report relation property updated with self-link")
+                return
+
+            logger.warning(
+                "Full Report relation targets another DB (%s); cannot auto-link without creating a row there",
+                target_db_id
+            )
+            return
+
+        logger.warning("Unsupported Full Report property type '%s'; skipping update", prop_type)
+    except Exception as e:
+        logger.warning("Failed to update Full Report property: %s", e)
+
+
 CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
 
 
@@ -322,8 +385,9 @@ TEXT:
 # ----------------------------
 def write_digest(summary_data, items_by_interest):
     logger.info("Writing digest to Notion")
+    logger.info("Target Digest DB: %s", DIGEST_DB_ID)
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now().strftime("%Y-%m-%d %H:%M")
     summary_text = summary_data.get("summary", "")
     alerts = summary_data.get("important_alerts", [])
     bullets = summary_data.get("summary_bullets", [])
@@ -343,6 +407,9 @@ def write_digest(summary_data, items_by_interest):
         }
     )
     digest_page_id = page["id"]
+    digest_page_url = notion_page_url(digest_page_id)
+    logger.info("Digest page created: %s", digest_page_id)
+    logger.info("Digest page URL: %s", digest_page_url)
 
     # Build full report blocks
     blocks = []
@@ -441,6 +508,19 @@ def write_digest(summary_data, items_by_interest):
         )
     logger.info("Full report appended to digest page %s", digest_page_id)
 
+    # Read back page metadata to make visibility/debugging issues obvious in logs.
+    try:
+        page_check = notion.pages.retrieve(page_id=digest_page_id)
+        parent = page_check.get("parent", {})
+        logger.info(
+            "Digest page verify: archived=%s, in_trash=%s, parent=%s",
+            page_check.get("archived", False),
+            page_check.get("in_trash", False),
+            parent
+        )
+    except Exception as e:
+        logger.warning("Digest page verify failed for %s: %s", digest_page_id, e)
+
     # Plain-text brief for logs / future notification workflows
     brief_lines = [f"=== DAILY BRIEF {today} ===", summary_text]
     if bullets:
@@ -449,6 +529,10 @@ def write_digest(summary_data, items_by_interest):
         brief_lines.append("ALERTS:")
         brief_lines += [f"  - {a['name']}: {a['update']}" for a in alerts]
     logger.info("\n%s", "\n".join(brief_lines))
+
+    # Ensure the digest row contains a clickable pointer in the Full Report column.
+    update_full_report_property(digest_page_id, digest_page_url)
+    logger.info("Open digest page directly: %s", digest_page_url)
 
     return digest_page_id
 
