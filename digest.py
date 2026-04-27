@@ -1,10 +1,13 @@
 import os
 import logging
 import requests
+import xml.etree.ElementTree as ET
+from urllib.parse import quote_plus
 from notion_client import Client
 from openai import OpenAI
 from dotenv import load_dotenv
 from datetime import datetime
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,19 +61,38 @@ def get_interests():
 # (placeholder web search layer)
 # ----------------------------
 def fetch_updates(name):
-    # Minimal v1: use a lightweight web search via API or placeholder
-    # You can upgrade this later to Tavily / SerpAPI / News API
-    logger.info("Fetching updates for: %s", name)
-    query = f"{name} latest news tour interview 2026"
+    logger.info("Fetching RSS updates for: %s", name)
 
-    response = requests.get(
-        "https://api.duckduckgo.com/",
-        params={"q": query, "format": "json"}
-    )
+    # Google News RSS search endpoint
+    query = quote_plus(f"{name} music tour interview announcement OR release")
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-GB&gl=GB&ceid=GB:en"
 
-    data = response.json()
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+    except Exception as e:
+        logger.warning("RSS fetch failed for %s: %s", name, e)
+        return []
 
-    return data.get("AbstractText", "") or data.get("RelatedTopics", "")
+    # Parse XML feed
+    root = ET.fromstring(response.content)
+
+    items = []
+
+    for item in root.findall(".//item")[:5]:  # limit noise
+        title = item.find("title").text if item.find("title") is not None else ""
+        link = item.find("link").text if item.find("link") is not None else ""
+        pub_date = item.find("pubDate").text if item.find("pubDate") is not None else ""
+
+        items.append({
+            "title": title,
+            "link": link,
+            "date": pub_date
+        })
+
+    logger.info("Found %d RSS items for %s", len(items), name)
+
+    return items
 
 
 # ----------------------------
@@ -79,15 +101,36 @@ def fetch_updates(name):
 def summarise(all_updates):
     logger.info("Generating summary via OpenAI")
     prompt = f"""
-You are a cultural assistant.
+You are a CULTURE INTELLIGENCE assistant.
 
-From the following raw updates, create a concise daily digest.
+Your job is to extract ONLY real cultural updates about artists, writers, and creators.
+
+You MUST NOT invent or generalise.
 
 Rules:
-- Only include meaningful updates (releases, tours, collaborations, announcements)
-- Ignore generic noise
-- Highlight London relevance if present
-- Keep it structured
+- Only use information explicitly present in the data
+- If no real update exists, say "No verified update"
+- Ignore corporate language completely
+- Focus only on:
+  - tours
+  - releases
+  - collaborations
+  - interviews
+  - recommendations
+- Do NOT mention:
+  - business metrics
+  - engineering
+  - product updates
+  - generic summaries
+
+Return format:
+
+## Daily Digest
+
+For each person:
+- Name
+- Update (or "No update")
+- Relevance (London / Global / None)
 
 DATA:
 {all_updates}
