@@ -2,3 +2,5 @@ notion-client==2.2.1
 openai
 requests
 python-dotenv
+feedparser
+beautifulsoup4
