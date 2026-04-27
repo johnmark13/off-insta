@@ -1,0 +1,31 @@
+name: Daily Culture Digest
+
+on:
+  schedule:
+    - cron: "0 8 * * *" # 8AM UTC daily
+  workflow_dispatch: # allows manual run button
+
+jobs:
+  run-digest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run script
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          INTERESTS_DB_ID: ${{ secrets.INTERESTS_DB_ID }}
+          DIGEST_DB_ID: ${{ secrets.DIGEST_DB_ID }}
+          DISCOVERY_DB_ID: ${{ secrets.DISCOVERY_DB_ID }}
+        run: python digest.py
