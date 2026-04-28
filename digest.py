@@ -2,9 +2,10 @@ import os
 import logging
 import hashlib
 import json
+import re
 import requests
 import xml.etree.ElementTree as ET
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit, urlunsplit, parse_qsl, urlencode
 from datetime import datetime
 from pathlib import Path
 from notion_client import Client
@@ -52,7 +53,29 @@ ai = OpenAI(api_key=OPENAI_API_KEY)
 # Staleness cache (3-day novelty window)
 # ----------------------------
 CACHE_PATH = Path(".cache") / "seen_urls.json"
-STALENESS_DAYS = 3
+STALENESS_DAYS = 7
+TRACKING_QUERY_PREFIXES = ("utm_",)
+TRACKING_QUERY_KEYS = {
+    "fbclid", "gclid", "msclkid", "twclid", "mc_cid", "mc_eid", "ref", "ref_src"
+}
+NEWS_QUERY_TERMS = [
+    "news",
+    "announcement",
+    "release",
+    "tour",
+    "live show",
+    "festival",
+    "interview",
+    "podcast",
+    "tv appearance",
+    "radio appearance",
+    "talk",
+    "speech",
+    "panel",
+    "gallery show",
+    "art exhibition",
+    "collaboration"
+]
 
 
 def load_seen_urls():
@@ -71,16 +94,62 @@ def save_seen_urls(seen):
         json.dump(seen, f)
 
 
-def is_stale(url, seen):
-    key = hashlib.md5(url.encode()).hexdigest()
+def canonicalize_url(url):
+    """Normalize URL to reduce duplicate variants caused by trackers and fragments."""
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url.strip())
+        scheme = parts.scheme.lower() if parts.scheme else "https"
+        netloc = parts.netloc.lower()
+        path = parts.path or ""
+        if path != "/":
+            path = path.rstrip("/")
+
+        params = []
+        for key, value in parse_qsl(parts.query, keep_blank_values=False):
+            key_lower = key.lower()
+            if key_lower.startswith(TRACKING_QUERY_PREFIXES) or key_lower in TRACKING_QUERY_KEYS:
+                continue
+            params.append((key, value))
+        params.sort()
+
+        normalized_query = urlencode(params)
+        return urlunsplit((scheme, netloc, path, normalized_query, ""))
+    except Exception:
+        return url.strip()
+
+
+def normalize_title_for_fingerprint(title):
+    """Create a stable title string for same-story dedupe across different links."""
+    cleaned = (title or "").lower().strip()
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def item_dedupe_keys(item, interest_name):
+    """Return cache keys used for duplicate detection (url + title fingerprint)."""
+    keys = []
+    canonical = canonicalize_url(item.get("link", ""))
+    if canonical:
+        keys.append(f"url:{hashlib.md5(canonical.encode()).hexdigest()}")
+
+    title_norm = normalize_title_for_fingerprint(item.get("title", ""))
+    if title_norm:
+        title_seed = f"{interest_name.lower()}|{title_norm}"
+        keys.append(f"title:{hashlib.md5(title_seed.encode()).hexdigest()}")
+    return keys
+
+
+def is_stale_key(key, seen):
     if key not in seen:
         return False
     last_seen = datetime.fromisoformat(seen[key])
     return (datetime.now() - last_seen).days < STALENESS_DAYS
 
 
-def mark_seen(url, seen):
-    key = hashlib.md5(url.encode()).hexdigest()
+def mark_seen_key(key, seen):
     seen[key] = datetime.now().isoformat()
 
 
@@ -195,7 +264,9 @@ def get_interests():
 # ----------------------------
 def fetch_rss(name):
     logger.info("Fetching RSS for: %s", name)
-    query = quote_plus(f"{name} music tour interview announcement OR release")
+    terms = " OR ".join(f'"{term}"' if " " in term else term for term in NEWS_QUERY_TERMS)
+    query_text = f'"{name}" ({terms})'
+    query = quote_plus(query_text)
     url = f"https://news.google.com/rss/search?q={query}&hl=en-GB&gl=GB&ceid=GB:en"
     try:
         response = requests.get(url, timeout=10)
@@ -282,21 +353,48 @@ def fetch_updates(interest, seen_urls):
     all_items = rss_items + web_items
 
     fresh_items = []
-    stale_count = 0
-    for item in all_items:
-        if item["link"] and is_stale(item["link"], seen_urls):
-            stale_count += 1
-        else:
-            fresh_items.append(item)
-            if item["link"]:
-                mark_seen(item["link"], seen_urls)
+    stale_url_count = 0
+    stale_title_count = 0
+    in_run_duplicate_count = 0
+    run_seen_keys = set()
 
-    if stale_count:
-        logger.info("Filtered %d stale items for %s", stale_count, name)
+    for item in all_items:
+        keys = item_dedupe_keys(item, name)
+        if not keys:
+            fresh_items.append(item)
+            continue
+
+        if any(key in run_seen_keys for key in keys):
+            in_run_duplicate_count += 1
+            continue
+
+        stale_hit = False
+        for key in keys:
+            if is_stale_key(key, seen_urls):
+                stale_hit = True
+                if key.startswith("url:"):
+                    stale_url_count += 1
+                elif key.startswith("title:"):
+                    stale_title_count += 1
+                break
+
+        if stale_hit:
+            continue
+
+        fresh_items.append(item)
+        for key in keys:
+            run_seen_keys.add(key)
+            mark_seen_key(key, seen_urls)
+
+    if stale_url_count or stale_title_count or in_run_duplicate_count:
+        logger.info(
+            "Filtered duplicates for %s: stale_url=%d stale_title=%d in_run=%d",
+            name, stale_url_count, stale_title_count, in_run_duplicate_count
+        )
 
     logger.info(
-        "Total fresh items for %s: %d (rss=%d, web=%d)",
-        name, len(fresh_items), len(rss_items), len(web_items)
+        "Total fresh items for %s: %d (rss=%d, web=%d, raw=%d)",
+        name, len(fresh_items), len(rss_items), len(web_items), len(all_items)
     )
     return fresh_items
 
@@ -473,6 +571,17 @@ def write_digest(summary_data, items_by_interest):
                 "object": "block", "type": "heading_3",
                 "heading_3": {"rich_text": [{"type": "text", "text": {"content": interest_name}}]}
             })
+            if not items:
+                blocks.append({
+                    "object": "block", "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                        "rich_text": [{
+                            "type": "text",
+                            "text": {"content": f"No new news regarding {interest_name}."}
+                        }]
+                    }
+                })
+                continue
             for item in items:
                 label = item["title"] or item["link"]
                 if item["link"]:
@@ -659,7 +768,7 @@ def run():
 
         all_updates += f"\n\n{interest['name']}:\n"
         if not items:
-            all_updates += "No recent news found\n"
+            all_updates += f"No new news regarding {interest['name']}.\n"
             continue
         for u in items:
             all_updates += f"- {u['title']}\n  {u.get('date', '')}\n  {u['link']}\n"
