@@ -52,7 +52,7 @@ ai = OpenAI(api_key=OPENAI_API_KEY)
 # ----------------------------
 # Staleness cache (3-day novelty window)
 # ----------------------------
-CACHE_PATH = Path(".cache") / "seen_urls.json"
+CACHE_PATH = Path(__file__).parent / ".cache" / "seen_urls.json"
 STALENESS_DAYS = 7
 TRACKING_QUERY_PREFIXES = ("utm_",)
 TRACKING_QUERY_KEYS = {
@@ -260,38 +260,104 @@ def get_interests():
 
 
 # ----------------------------
-# 2a. Fetch RSS (Google News)
+# 2a. Fetch RSS (Google News + Bing News)
 # ----------------------------
-def fetch_rss(name):
-    logger.info("Fetching RSS for: %s", name)
-    terms = " OR ".join(f'"{term}"' if " " in term else term for term in NEWS_QUERY_TERMS)
-    query_text = f'"{name}" ({terms})'
-    query = quote_plus(query_text)
-    url = f"https://news.google.com/rss/search?q={query}&hl=en-GB&gl=GB&ceid=GB:en"
+def _parse_rss_items(content, max_items=5, source_type="rss"):
+    """Parse raw RSS/XML bytes into item dicts."""
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-    except Exception as e:
-        logger.warning("RSS fetch failed for %s: %s", name, e)
+        root = ET.fromstring(content)
+    except ET.ParseError as e:
+        logger.warning("XML parse error: %s", e)
         return []
-    root = ET.fromstring(response.content)
     items = []
-    for item in root.findall(".//item")[:5]:
+    for item in root.findall(".//item")[:max_items]:
         title = item.find("title").text if item.find("title") is not None else ""
         link = item.find("link").text if item.find("link") is not None else ""
         pub_date = item.find("pubDate").text if item.find("pubDate") is not None else ""
-        items.append({"title": title, "link": link, "date": pub_date, "source_type": "rss"})
-    logger.info("RSS found %d items for %s", len(items), name)
+        items.append({"title": title, "link": link, "date": pub_date, "source_type": source_type})
+    return items
+
+
+def _fetch_rss_url(url, source_type="rss", name=""):
+    try:
+        response = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+        return _parse_rss_items(response.content, source_type=source_type)
+    except Exception as e:
+        logger.warning("RSS fetch failed (%s) for %s: %s", source_type, name, e)
+        return []
+
+
+def fetch_rss(name):
+    logger.info("Fetching RSS for: %s", name)
+    items = []
+
+    # 1. Google News — targeted event/news query
+    terms = " OR ".join(f'"{term}"' if " " in term else term for term in NEWS_QUERY_TERMS)
+    query_text = f'"{name}" ({terms})'
+    gn_url = f"https://news.google.com/rss/search?q={quote_plus(query_text)}&hl=en-GB&gl=GB&ceid=GB:en"
+    items += _fetch_rss_url(gn_url, source_type="rss_google_news", name=name)
+
+    # 2. Google News — broader query (catches reviews, profiles, general press)
+    broad_query = f'"{name}"'
+    gn_broad_url = f"https://news.google.com/rss/search?q={quote_plus(broad_query)}&hl=en-GB&gl=GB&ceid=GB:en"
+    broad_items = _fetch_rss_url(gn_broad_url, source_type="rss_google_broad", name=name)
+    # Only take items not already in targeted results (by link)
+    existing_links = {i["link"] for i in items}
+    items += [i for i in broad_items if i["link"] not in existing_links]
+
+    # 3. Bing News RSS
+    bing_url = f"https://www.bing.com/news/search?q={quote_plus(f'{name} music art')}&format=rss"
+    bing_items = _fetch_rss_url(bing_url, source_type="rss_bing", name=name)
+    existing_links = {i["link"] for i in items}
+    items += [i for i in bing_items if i["link"] not in existing_links]
+
+    logger.info("RSS found %d items for %s (google_targeted + google_broad + bing)", len(items), name)
     return items
 
 
 # ----------------------------
 # 2b. Fetch Web Link content
 # ----------------------------
+_YT_CHANNEL_RE = re.compile(
+    r"youtube\.com/(?:channel/(UC[\w-]+)|@([\w.-]+)|c/([\w.-]+)|user/([\w.-]+))"
+)
+
+
+def _youtube_channel_rss(url):
+    """Return RSS items from a YouTube channel page URL, or [] if not a YouTube URL."""
+    m = _YT_CHANNEL_RE.search(url)
+    if not m:
+        return []
+    channel_id, handle, legacy_c, legacy_user = m.groups()
+    if channel_id:
+        feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+        logger.info("Fetching YouTube channel RSS: %s", feed_url)
+        return _fetch_rss_url(feed_url, source_type="youtube_rss")
+
+    # For handle/custom/user URLs we need to resolve the channel ID first
+    try:
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        cid_match = re.search(r'"channelId"\s*:\s*"(UC[\w-]+)"', resp.text)
+        if cid_match:
+            feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={cid_match.group(1)}"
+            logger.info("Resolved YouTube channel RSS: %s", feed_url)
+            return _fetch_rss_url(feed_url, source_type="youtube_rss")
+    except Exception as e:
+        logger.warning("YouTube channel ID resolution failed for %s: %s", url, e)
+    return []
+
+
 def fetch_web_link(url):
     if not url:
         return []
     logger.info("Fetching web link: %s", url)
+
+    # YouTube channel — grab video RSS feed directly
+    yt_items = _youtube_channel_rss(url)
+    if yt_items:
+        return yt_items
 
     # Try feedparser first (handles feeds and some HTML pages)
     if HAS_FEEDPARSER:
