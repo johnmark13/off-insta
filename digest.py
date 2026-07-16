@@ -6,7 +6,8 @@ import re
 import requests
 import xml.etree.ElementTree as ET
 from urllib.parse import quote_plus, urlsplit, urlunsplit, parse_qsl, urlencode
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from notion_client import Client
 from openai import OpenAI
@@ -240,6 +241,57 @@ def update_full_report_property(digest_page_id, digest_page_url):
 
 
 CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
+RECENT_HISTORY_DAYS = 7
+RECENT_HISTORY_MAX_PAGES = 6
+
+
+# ----------------------------
+# 0. Recent digest history (avoid re-reporting the same story)
+# ----------------------------
+def get_recent_digest_history(days=RECENT_HISTORY_DAYS, max_pages=RECENT_HISTORY_MAX_PAGES):
+    """Pull the Summary text of recent digest rows so the AI can see what's already
+    been reported and avoid treating the same ongoing story as new every day."""
+    logger.info("Fetching last %d days of digest history for continuity context", days)
+    try:
+        results = notion.databases.query(
+            database_id=DIGEST_DB_ID,
+            sorts=[{"property": "Date", "direction": "descending"}],
+            page_size=max_pages
+        )
+    except Exception as e:
+        logger.warning("Could not fetch digest history: %s", e)
+        return []
+
+    cutoff = datetime.now() - timedelta(days=days)
+    history = []
+    for page in results.get("results", []):
+        props = page.get("properties", {})
+        title_parts = props.get("Date", {}).get("title", [])
+        date_str = title_parts[0]["text"]["content"] if title_parts else ""
+        try:
+            page_date = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
+        except Exception:
+            continue
+        if page_date < cutoff:
+            continue
+
+        summary_parts = props.get("Summary", {}).get("rich_text", [])
+        summary_text = summary_parts[0]["text"]["content"] if summary_parts else ""
+        if summary_text:
+            history.append({"date": date_str, "summary": summary_text})
+
+    logger.info("Found %d prior digest(s) within the last %d days", len(history), days)
+    return history
+
+
+def format_recent_history(history):
+    """Render prior digest summaries as a block of text for the AI prompt."""
+    if not history:
+        return "(no prior digests in the lookback window — treat everything as potentially new)"
+    lines = []
+    for entry in history:
+        lines.append(f"- [{entry['date']}] {entry['summary']}")
+    return "\n".join(lines)
 
 
 # ----------------------------
@@ -278,14 +330,39 @@ def _parse_rss_items(content, max_items=5, source_type="rss"):
     return items
 
 
-def _fetch_rss_url(url, source_type="rss", name=""):
+def _fetch_rss_url(url, source_type="rss", name="", max_items=6):
+    """Fetch a feed URL and parse it, preferring feedparser (handles both RSS 2.0 and Atom —
+    e.g. YouTube/Reddit feeds are Atom and have no <item> tags, only <entry>)."""
+    if HAS_FEEDPARSER:
+        try:
+            feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
+            if feed.entries:
+                items = []
+                for entry in feed.entries[:max_items]:
+                    items.append({
+                        "title": entry.get("title", ""),
+                        "link": entry.get("link", ""),
+                        "date": entry.get("published", entry.get("updated", "")),
+                        "source_type": source_type
+                    })
+                return items
+        except Exception as e:
+            logger.warning("feedparser failed (%s) for %s: %s", source_type, name, e)
+
     try:
         response = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         response.raise_for_status()
-        return _parse_rss_items(response.content, source_type=source_type)
+        return _parse_rss_items(response.content, max_items=max_items, source_type=source_type)
     except Exception as e:
         logger.warning("RSS fetch failed (%s) for %s: %s", source_type, name, e)
         return []
+
+
+def _merge_new(items, new_items):
+    """Append items from new_items whose link isn't already present in items."""
+    existing_links = {i["link"] for i in items if i["link"]}
+    items += [i for i in new_items if i["link"] not in existing_links]
+    return items
 
 
 def fetch_rss(name):
@@ -299,20 +376,26 @@ def fetch_rss(name):
     items += _fetch_rss_url(gn_url, source_type="rss_google_news", name=name)
 
     # 2. Google News — broader query (catches reviews, profiles, general press)
-    broad_query = f'"{name}"'
-    gn_broad_url = f"https://news.google.com/rss/search?q={quote_plus(broad_query)}&hl=en-GB&gl=GB&ceid=GB:en"
-    broad_items = _fetch_rss_url(gn_broad_url, source_type="rss_google_broad", name=name)
-    # Only take items not already in targeted results (by link)
-    existing_links = {i["link"] for i in items}
-    items += [i for i in broad_items if i["link"] not in existing_links]
+    gn_broad_query = '"' + name + '"'
+    gn_broad_url = f"https://news.google.com/rss/search?q={quote_plus(gn_broad_query)}&hl=en-GB&gl=GB&ceid=GB:en"
+    _merge_new(items, _fetch_rss_url(gn_broad_url, source_type="rss_google_broad", name=name))
 
     # 3. Bing News RSS
     bing_url = f"https://www.bing.com/news/search?q={quote_plus(f'{name} music art')}&format=rss"
-    bing_items = _fetch_rss_url(bing_url, source_type="rss_bing", name=name)
-    existing_links = {i["link"] for i in items}
-    items += [i for i in bing_items if i["link"] not in existing_links]
+    _merge_new(items, _fetch_rss_url(bing_url, source_type="rss_bing", name=name))
 
-    logger.info("RSS found %d items for %s (google_targeted + google_broad + bing)", len(items), name)
+    # 4. GDELT — global news index, independent of Google/Bing's own ranking/dedup logic
+    gdelt_url = (
+        "https://api.gdeltproject.org/api/v2/doc/doc"
+        f"?query={quote_plus(name)}&mode=artlist&maxrecords=8&format=RSS&sort=datedesc"
+    )
+    _merge_new(items, _fetch_rss_url(gdelt_url, source_type="rss_gdelt", name=name))
+
+    # 5. Reddit search — catches fan/community chatter often ahead of press coverage
+    reddit_url = f"https://www.reddit.com/search.rss?q={quote_plus(name)}&sort=new&limit=8"
+    _merge_new(items, _fetch_rss_url(reddit_url, source_type="rss_reddit", name=name))
+
+    logger.info("RSS found %d items for %s (google x2 + bing + gdelt + reddit)", len(items), name)
     return items
 
 
@@ -409,6 +492,38 @@ def fetch_web_link(url):
 # ----------------------------
 # 2c. Merged fetch with staleness filter
 # ----------------------------
+MAX_ITEM_AGE_DAYS = 5
+
+
+def _parse_item_date(date_str):
+    """Parse an RFC-822/ISO pub date string into an aware datetime, or None if unparseable."""
+    if not date_str:
+        return None
+    try:
+        dt = parsedate_to_datetime(date_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        try:
+            dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return None
+
+
+def _is_recent_item(item, max_age_days=MAX_ITEM_AGE_DAYS):
+    """Keep items published within the window, or items with no parseable date
+    (e.g. scraped web metadata) so we don't silently drop a whole source."""
+    dt = _parse_item_date(item.get("date", ""))
+    if dt is None:
+        return True
+    age_days = (datetime.now(timezone.utc) - dt).days
+    return age_days <= max_age_days
+
+
 def fetch_updates(interest, seen_urls):
     name = interest["name"]
     web = interest.get("web")
@@ -417,6 +532,16 @@ def fetch_updates(interest, seen_urls):
     web_items = fetch_web_link(web) if web else []
 
     all_items = rss_items + web_items
+
+    # Google/Bing News often rank by relevance, not recency, so the same "evergreen"
+    # articles surface every run. Sort newest-first and drop anything stale so the
+    # per-source cap keeps the freshest items instead of the most "relevant" ones.
+    all_items.sort(key=lambda i: _parse_item_date(i.get("date", "")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    recent_count_before = len(all_items)
+    all_items = [i for i in all_items if _is_recent_item(i)]
+    dropped_old = recent_count_before - len(all_items)
+    if dropped_old:
+        logger.info("Dropped %d stale (>%dd old) items for %s", dropped_old, MAX_ITEM_AGE_DAYS, name)
 
     fresh_items = []
     stale_url_count = 0
@@ -468,10 +593,11 @@ def fetch_updates(interest, seen_urls):
 # ----------------------------
 # 3. AI summariser — structured output
 # ----------------------------
-def summarise(all_updates, interests):
+def summarise(all_updates, interests, recent_history=None):
     logger.info("Generating structured summary via OpenAI")
 
     interest_names = ", ".join(i["name"] for i in interests)
+    history_block = format_recent_history(recent_history or [])
 
     prompt = f"""
 You are a CULTURE INTELLIGENCE assistant analysing updates for: {interest_names}
@@ -494,12 +620,25 @@ Return STRICT JSON — no markdown fences, no extra text:
   "sources_used": ["url or headline title"]
 }}
 
+PREVIOUSLY REPORTED (last {RECENT_HISTORY_DAYS} days — do NOT re-report these as new):
+{history_block}
+
 Rules:
+- Compare today's DATA against PREVIOUSLY REPORTED above. If an item is just continued
+  coverage of a story already reported (same release, same tour, same announcement) with
+  no materially new development, put it in skip_list, not summary_bullets/important_alerts.
+- Only put something in important_alerts or summary_bullets if it is either a genuinely new
+  story, or a concrete NEW development on a known story (e.g. a date/venue/detail confirmed
+  that wasn't known before). Restating the same fact in different words is NOT new.
 - important_alerts: HIGH-CONFIDENCE events only (releases, tours, official announcements, collaborations)
-- summary_bullets: one bullet per significant finding
-- skip_list: repeated, low-relevance, or off-topic items
+- summary_bullets: one bullet per significant NEW finding
+- skip_list: repeated/already-reported, low-relevance, or off-topic items
 - sources_used: all source links or titles referenced
 - Only use provided data — do NOT invent anything
+- It is completely normal and expected for there to be NO new news for an interest on a
+  given day. Do not manufacture significance to fill space. If, after filtering out
+  already-reported stories, nothing new remains for an interest, say so plainly (e.g.
+  "No new developments for X today") rather than re-surfacing old coverage.
 - If nothing exists return empty lists []
 
 DATA:
@@ -824,6 +963,7 @@ def run():
 
     interests = get_interests()
     seen_urls = load_seen_urls()
+    recent_history = get_recent_digest_history()
 
     all_updates = ""
     items_by_interest = {}
@@ -841,7 +981,7 @@ def run():
 
     logger.info("\n%s\n%s\n%s", "=" * 60, all_updates.strip(), "=" * 60)
 
-    raw = summarise(all_updates, interests)
+    raw = summarise(all_updates, interests, recent_history=recent_history)
     logger.info("\n%s\nOPENAI RAW RESPONSE:\n%s\n%s", "-" * 60, raw.strip(), "-" * 60)
 
     summary_data = parse_json_safe(raw, fallback={
